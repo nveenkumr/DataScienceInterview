@@ -88,67 +88,128 @@ ORDER BY ChannelId, start_date
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 2. Extract Transactions Up to Spend Limit
-# MAGIC **Problem:** Given two tables:
-# MAGIC - `account_limits(account, spend_limit)`
-# MAGIC - `account_transactions(account, amount)` (chronological order),
-# MAGIC select each transaction such that the **cumulative sum** for that account does **not** exceed its `spend_limit`.
+# MAGIC ## 2. Find Numbers Occurring Three Consecutively
+**Problem:** Given a table `emp_numbers(id, numbers)`, find all numbers that occur three times in a row.
 
 # PySpark Solution
-# Load sample data
-data_limits = [("1",300),("2",200),("3",1000)]
-data_tx = [
-    ("1",100),("1",100),("1",200),
-    ("2",50),("2",100),("2",50),("2",200),
-    ("3",500),("3",600),("3",300),("3",200),("3",300)
-]
-limits_df = spark.createDataFrame(data_limits, ["account","spend_limit"])
-tx_df = spark.createDataFrame(data_tx, ["account","amount"])
-
+```python
 from pyspark.sql.window import Window
-w2 = Window.partitionBy("account").orderBy("amount").rowsBetween(Window.unboundedPreceding, 0)
-tx_flagged = (
-    tx_df
-    .withColumn("running_total", F.sum("amount").over(w2))
-    .join(limits_df, on="account", how="left")
-    .filter(F.col("running_total") <= F.col("spend_limit"))
-    .select("account","amount","running_total")
+from pyspark.sql import functions as F
+# Assume emp_numbers is a DataFrame
+sdf = spark.table("emp_numbers")
+w = Window.orderBy("id")
+result = (
+    sdf
+    .withColumn("prev1", F.lag("numbers", 1).over(w))
+    .withColumn("prev2", F.lag("numbers", 2).over(w))
+    .filter((F.col("numbers") == F.col("prev1")) & (F.col("numbers") == F.col("prev2")))
+    .select("id", "numbers")
 )
-tx_flagged.show()
+result.show()
 # Sample Output:
-# +-------+------+-------------+
-# |account|amount|running_total|
-# +-------+------+-------------+
-# |      1|   100|          100|
-# |      1|   100|          200|
-# |      2|    50|           50|
-# |      2|   100|          150|
-# |      2|    50|          200|
-# |      3|   500|          500|
-# |      3|   600|         1100| <-- filtered out as >1000
-# |      3|   300|          800|
-# |      3|   200|         1000|
-# +-------+------+-------------+
+# +---+-------+
+# | id|numbers|
+# +---+-------+
+# |  3|      2|
+# |  8|      4|
+# +---+-------+
+```
 
 # Spark SQL Solution
-limits_df.createOrReplaceTempView("account_limits")
-tx_df.createOrReplaceTempView("account_transactions")
-spark.sql("""
+```sql
 WITH cte AS (
-  SELECT
-    t.account,
-    t.amount,
-    SUM(t.amount) OVER (PARTITION BY t.account ORDER BY t.amount ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total,
-    l.spend_limit
-  FROM account_transactions t
-  JOIN account_limits l ON t.account = l.account
+  SELECT 
+    id, numbers,
+    LAG(numbers,1) OVER (ORDER BY id) AS prev1,
+    LAG(numbers,2) OVER (ORDER BY id) AS prev2
+  FROM emp_numbers
 )
-SELECT account, amount, running_total
+SELECT id, numbers
 FROM cte
-WHERE running_total <= spend_limit
-ORDER BY account, running_total
-""").show()
+WHERE numbers = prev1 AND numbers = prev2;
+```
 
-# COMMAND ----------
-# MAGIC %md
-# MAGIC **End of additional questions notebook.**
+## 3. Identify Days with Temperature Increase
+**Problem:** Given `emp_temp(Days, Temp)`, find all days where the temperature was higher than the previous day.
+
+# PySpark Solution
+```python
+from pyspark.sql.window import Window
+from pyspark.sql import functions as F
+sdf = spark.table("emp_temp").withColumn("Days", F.to_date("Days"))
+w = Window.orderBy("Days")
+result = (
+    sdf
+    .withColumn("prev_temp", F.lag("Temp", 1).over(w))
+    .filter(F.col("Temp") > F.col("prev_temp"))
+)
+result.show()
+# Sample Output:
+# +----------+----+---------+
+# |      Days|Temp|prev_temp|
+# +----------+----+---------+
+# |2024-03-02|  22|       20|
+# |2024-03-04|  25|       19|
+# +----------+----+---------+
+```
+
+# Spark SQL Solution
+```sql
+SELECT Days, Temp
+FROM (
+  SELECT *, LAG(Temp) OVER (ORDER BY Days) AS prev_temp
+  FROM emp_temp
+) t
+WHERE Temp > prev_temp;
+```
+
+## 4. Fill Missing Dates in a Dataset
+**Problem:** Given `emp_gaps(date, id)` where some dates are missing, generate all missing dates between the min and max per partition.
+
+# PySpark Solution
+```python
+from pyspark.sql import functions as F
+# emp_gaps DataFrame with columns date (DateType) and id
+# 1. Compute min/max per id
+date_range = emp_gaps.groupBy("id").agg(
+    F.min("date").alias("start"),
+    F.max("date").alias("end")
+)
+# 2. Generate continuous sequences
+dates_seq = date_range.withColumn(
+    "full_dates",
+    F.expr("sequence(start, end, interval 1 day)")
+).select("id", F.explode("full_dates").alias("date"))
+# 3. Anti-join to find missing
+gaps = (
+    dates_seq
+    .join(emp_gaps, ["id", "date"], how="anti")
+)
+gaps.show()
+# Sample Output:
+# +---+----------+
+# | id|      date|
+# +---+----------+
+# |  1|2022-03-03|
+# +---+----------+
+```
+
+# Spark SQL Solution
+```sql
+WITH date_bounds AS (
+  SELECT id,
+         MIN(date) AS start,
+         MAX(date) AS end
+  FROM emp_gaps
+  GROUP BY id
+),
+all_dates AS (
+  SELECT id,
+         EXPLODE(sequence(start, end, interval 1 day)) AS date
+  FROM date_bounds
+)
+SELECT a.id, a.date
+FROM all_dates a
+LEFT ANTI JOIN emp_gaps g
+  ON a.id = g.id AND a.date = g.date;
+```
